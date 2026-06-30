@@ -32,7 +32,7 @@ def init_firebase():
             creds_path = f.name
         cred = credentials.Certificate(creds_path)
         firebase_admin.initialize_app(cred, {
-            'databaseURL': 'https://biocheckstation-default-rtdb.firebaseio.com/'
+            'databaseURL': 'https://garage-6749f-default-rtdb.firebaseio.com/'
         })
         firebase_ref = firebase_db.reference('/')
         print("✓ Firebase connected")
@@ -44,21 +44,20 @@ init_firebase()
 # ── OpenCV ────────────────────────────────────────────────────────────
 CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-recognizer = cv2.face.LBPHFaceRecognizer_create()
+recognizer   = cv2.face.LBPHFaceRecognizer_create()
 
 FACES_DIR = "/tmp/known_faces"
 os.makedirs(FACES_DIR, exist_ok=True)
 
-label_map = {}
-name_map  = {}
+label_map = {}  # int  → name
+name_map  = {}  # name → int
 
 def decode_image(b64_str):
     img_bytes = base64.b64decode(b64_str)
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     if max(img.size) > 640:
         img.thumbnail((640, 640), Image.LANCZOS)
-    arr = np.array(img)
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
 
 def extract_face(gray):
     faces = face_cascade.detectMultiScale(
@@ -98,6 +97,7 @@ def retrain():
         recognizer = cv2.face.LBPHFaceRecognizer_create()
         print("⚠ No faces to train on")
 
+# ── Firebase face persistence ─────────────────────────────────────────
 def save_face_to_firebase(name, img_path):
     if not firebase_ref:
         return
@@ -105,7 +105,7 @@ def save_face_to_firebase(name, img_path):
         with open(img_path, 'rb') as f:
             b64 = base64.b64encode(f.read()).decode('utf-8')
         firebase_ref.child('faces_data').child(name).set({'image': b64})
-        print(f"✓ Saved {name} to Firebase DB")
+        print(f"✓ Saved {name} to Firebase")
     except Exception as e:
         print(f"⚠ Firebase save failed: {e}")
 
@@ -115,7 +115,7 @@ def load_faces_from_firebase():
     try:
         data = firebase_ref.child('faces_data').get()
         if not data:
-            print("⚠ No faces in Firebase DB yet")
+            print("⚠ No faces in Firebase yet")
             return
         for name, val in data.items():
             if not val or 'image' not in val:
@@ -124,7 +124,7 @@ def load_faces_from_firebase():
             img_path = os.path.join(FACES_DIR, f"{name}.jpg")
             with open(img_path, 'wb') as f:
                 f.write(img_bytes)
-            print(f"↺ Loaded face: {name}")
+            print(f"↺ Loaded: {name}")
     except Exception as e:
         print(f"⚠ Firebase load failed: {e}")
 
@@ -133,18 +133,17 @@ def delete_face_from_firebase(name):
         return
     try:
         firebase_ref.child('faces_data').child(name).delete()
-        print(f"✓ Deleted {name} from Firebase DB")
+        print(f"✓ Deleted {name} from Firebase")
     except Exception as e:
         print(f"⚠ Firebase delete failed: {e}")
 
 def log_access(name, status, confidence):
-    """Write access attempt to Firebase log."""
     if not firebase_ref:
         return
     try:
         entry = {
             'name': name,
-            'status': status,  # 'granted' or 'denied'
+            'status': status,
             'confidence': confidence,
             'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -157,7 +156,7 @@ print("↺ Loading faces from Firebase...")
 load_faces_from_firebase()
 retrain()
 
-# ── Health ────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({
@@ -166,7 +165,6 @@ def health():
         "firebase": "connected" if firebase_ref else "disconnected"
     })
 
-# ── Face Registration ─────────────────────────────────────────────────
 @app.route("/register", methods=["POST"])
 def register_face():
     data = request.get_json()
@@ -178,7 +176,7 @@ def register_face():
         gray = decode_image(image_b64)
         face = extract_face(gray)
         if face is None:
-            return jsonify({"error": "No face detected. Use a clear, well-lit photo."}), 422
+            return jsonify({"error": "No face detected. Use a clear well-lit photo."}), 422
         img_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         if max(img.size) > 640:
@@ -192,87 +190,65 @@ def register_face():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Garage Recognise ──────────────────────────────────────────────────
 @app.route("/garage/recognise", methods=["POST"])
 def garage_recognise():
-    """
-    Called by the garage camera page.
-    Recognises face → if known, sets door_status=open in Firebase.
-    ESP32 watches Firebase and opens the door.
-    """
     data = request.get_json()
     image_b64 = data.get("image", "")
     if not image_b64:
         return jsonify({"error": "image required"}), 400
-
     if not name_map:
         return jsonify({"name": None, "status": "no_faces", "door": "closed"})
-
     try:
         gray = decode_image(image_b64)
         face = extract_face(gray)
 
         if face is None:
-            # No face in frame — keep door closed
             if firebase_ref:
                 firebase_ref.child('garage').update({
                     'current_visitor': 'Unknown',
                     'door_status': 'closed'
                 })
-            return jsonify({"name": None, "status": "no_face", "door": "closed"})
+            return jsonify({"name": None, "status": "no_face", "door": "closed", "faces_found": 0})
 
         label, distance = recognizer.predict(face)
         name = label_map.get(label, "Unknown")
         confidence = round(max(0, (100 - distance) / 100), 3)
-        print(f"→ Garage: {name} | distance={distance:.1f} | confidence={confidence}")
+        print(f"→ {name} | distance={distance:.1f} | confidence={confidence}")
 
         if distance > 100:
             name = "Unknown"
             confidence = 0
 
-        door = "closed"
-        status = "denied"
-
         if name != "Unknown":
-            door = "open"
-            status = "granted"
             if firebase_ref:
                 firebase_ref.child('garage').update({
                     'current_visitor': name,
                     'door_status': 'open',
                     'last_seen': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 })
-            print(f"✓ Access granted: {name} → door OPEN")
+            log_access(name, 'granted', confidence)
+            print(f"✓ Access GRANTED: {name}")
+            return jsonify({"name": name, "confidence": confidence, "door": "open", "status": "granted", "faces_found": 1})
         else:
             if firebase_ref:
                 firebase_ref.child('garage').update({
                     'current_visitor': 'Unknown',
                     'door_status': 'closed'
                 })
-            print("✗ Unknown person → door CLOSED")
-
-        log_access(name, status, confidence)
-
-        return jsonify({
-            "name": name,
-            "confidence": confidence,
-            "door": door,
-            "status": status,
-            "faces_found": 1
-        })
+            log_access('Unknown', 'denied', confidence)
+            print("✗ Access DENIED: Unknown")
+            return jsonify({"name": None, "confidence": 0, "door": "closed", "status": "denied", "faces_found": 1})
 
     except Exception as e:
-        print(f"Garage recognise error: {e}")
+        print(f"Recognise error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ── Close door endpoint (called after delay) ──────────────────────────
 @app.route("/garage/close", methods=["POST"])
 def garage_close():
     if firebase_ref:
         firebase_ref.child('garage').update({'door_status': 'closed'})
     return jsonify({"door": "closed"})
 
-# ── Faces list / delete ───────────────────────────────────────────────
 @app.route("/faces", methods=["GET"])
 def list_faces():
     return jsonify({"faces": list(name_map.keys())})
